@@ -1,6 +1,5 @@
 /*
  * Copyright (C) 2026 Robson Filgueiras.
- * 
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
@@ -13,6 +12,33 @@
  * 
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * ----------------------------------------------------------------------
+ *
+ * This project is based on and includes modifications to the U8x_Laser_Distance
+ * project by Chandra Wijaya Sentosa, which is licensed under the MIT License:
+ *
+ * MIT License
+ * 
+ * Copyright (c) 2023 Chandra Wijaya Sentosa
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 #include <SPI.h>
@@ -24,46 +50,21 @@
 #include <Adafruit_ILI9341.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include <AccelStepper.h>
 
-// Controle de Placa
-#define USE_CYD_BOARD 1
-
-
-  #include <Adafruit_FT6206.h>
-
-
-#include <Fonts/FreeSans9pt7b.h>
-#include <Fonts/FreeSansBold9pt7b.h>
-
-/* ================================================================
-   PROJETO:     GeoTank LaserScan v3.0
-   PLATAFORMA:  ESP32 DevKit C V4
-   DESCRIÇÃO:   Perfilometria de fundo de tanque por laser/ultrassônico.
-                Varredura centrípeta com cota topográfica adaptativa.
-                Referência angular: θ a partir do eixo horizontal.
-                Cota = H - L × sin(θ). Negativo = recalque.
-   ================================================================ */
-
-// ── Flag de Placa ────────────────────────────────────────────────
-// Mude para 0 para usar o hardware original (ESP32 DevKit + FT6206)
-// Mude para 1 para testar a UI na placa ESP32-2432S028R (CYD - Cheap Yellow Display)
-// (Definido no topo do arquivo)
-
-// ── Pinagem ──────────────────────────────────────────────────────
-
-  #define TFT_CS    15
-  #define TFT_DC     2
-  #define TFT_RST    4
-  #define PIN_STEP  25
-  #define PIN_DIR   26
-  #define PIN_ENA   27
-  #define PIN_SD_CS  5
-
+// ── Pinagem (ANTES de qualquer instância que use os pinos) ───────
+#define TFT_CS    15
+#define TFT_DC     2
+#define TFT_RST    4
+#define PIN_STEP  25
+#define PIN_DIR   26
+#define PIN_ENA   27
+#define PIN_SD_CS  5
 
 // Simulador vs Hardware Real
-#define SIMULACAO_WOKWI true  // Mude para false no ESP32 físico
+#define SIMULACAO_WOKWI false  // Hardware real — laser via Serial2, IMU via MPU6050
 
-// Pinos Ultrassônico (Wokwi)
+// Pinos Ultrassônico (Wokwi apenas)
 #define PIN_TRIG  13
 #define PIN_ECHO  12
 
@@ -74,11 +75,35 @@
 // Buzzer de feedback
 #define PIN_BUZZER 32
 
+// ── Motor e Laser Async ───────────────────────────────────────────
+AccelStepper stepper(AccelStepper::DRIVER, PIN_STEP, PIN_DIR);
+bool novaLeituraLaser = false;
+float ultimaDistanciaLaser = 0.0f;
+char bufferLaser[32];
+int bufferIndex = 0;
+
+// Controle de Placa
+#define USE_CYD_BOARD 1
+
+#include <XPT2046_Touchscreen.h>
+#define TOUCH_CS 14
+
+#include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/FreeSansBold9pt7b.h>
+#include "priner_logo.h"
+
+/* ================================================================
+   PROJETO:     GeoTank LaserScan v3.0
+   PLATAFORMA:  ESP32 DevKit C V4
+   DESCRIÇÃO:   Perfilometria de fundo de tanque por laser/ultrassônico.
+                Varredura centrípeta com cota topográfica adaptativa.
+                Referência angular: θ a partir do eixo horizontal.
+                Cota = H - L × sin(θ). Negativo = recalque.
+   ================================================================ */
+
 // ── Periféricos ──────────────────────────────────────────────────
-
-  Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
-  Adafruit_FT6206  ts;
-
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+XPT2046_Touchscreen ts(TOUCH_CS);
 
 Adafruit_MPU6050 mpu;
 
@@ -222,7 +247,7 @@ Zone confirmYesZone = {165, 140, 145, 50};
 void drawCentered(const char* str, int16_t cx, int16_t cy) {
     int16_t x1, y1;
     uint16_t tw, th;
-    tft.getTextBounds(str, 0, 0, &x1, &y1, &tw, &th);
+	tft.getTextBounds(str, 0, 0, &x1, &y1, &tw, &th);
     tft.setCursor(cx - (tw / 2) - x1, cy - (th / 2) - y1);
     tft.print(str);
 }
@@ -258,19 +283,43 @@ void drawButton(int16_t x, int16_t y, int16_t w, int16_t h,
 }
 
 void drawHeader() {
+    tft.setTextSize(1); // Trava de segurança (impede vazamento da fonte tamanho 3 do Horizon)
     tft.fillRect(0, 0, 320, 24, C_HEADER);
     tft.setFont(&FreeSansBold9pt7b);
-    tft.setTextColor(C_ACCENT);
-    tft.setCursor(4, 17);
+    tft.setTextColor(C_ACCENT); // Cor do título restaurada
+    tft.setCursor(2, 17); // Puxado 2 pixels para a esquerda
     tft.print("GeoTank v3.0");
+
+    // Desenha apenas o símbolo verde da Priner (cortado rigorosamente)
+    int16_t logo_x = 124; // Mais perto do GeoTank
+    int16_t logo_y = 4;   // Centralizado no header (agora tem 16px de altura -> (24-16)/2 = 4)
+    for (int y = 0; y < priner_logo_h; y++) {
+        for (int x = 0; x < priner_logo_w; x++) {
+            uint16_t color = pgm_read_word(&priner_logo_data[y * priner_logo_w + x]);
+			  if (color != 0xFFFF) {
+                tft.drawPixel(logo_x + x, logo_y + y, color);
+            }
+        }
+    }
+
+    // Escreve a palavra "Priner" (P maiúsculo e fonte normal para economizar espaço horizontal)
+    tft.setFont(&FreeSans9pt7b); // Fonte mais fina que a Bold
+    tft.setTextColor(C_DIM);
+    tft.setCursor(logo_x + priner_logo_w + 3, 17);
+    tft.print("Priner");
 
     tft.setFont(NULL);
     tft.setTextSize(1);
     int16_t xr = 316;
     
+    // Silhueta de bateria vazada contendo o percentual no interior
+    tft.drawRect(xr - 36, 4, 34, 16, C_BORDER); // Corpo da bateria
+    tft.fillRect(xr - 38, 8, 2, 8, C_BORDER);   // Terminal positivo
+    
     tft.setTextColor(C_GREEN);
-    drawRightAligned("85%", xr, 12);
-    xr -= 30;
+    drawRightAligned("85%", xr - 10, 12);
+    
+    xr -= 46;
 
     tft.setTextColor(imuOnline ? C_GREEN : C_RED);
     drawRightAligned("IMU", xr, 12);
@@ -294,9 +343,14 @@ void drawFooter(const char* msg) {
 }
 
 void beep(int ms) {
-    digitalWrite(PIN_BUZZER, HIGH);
-    delay(ms);
-    digitalWrite(PIN_BUZZER, LOW);
+    // Trem de pulsos a ~2 kHz para excitar tanto buzzers passivos quanto ativos
+    unsigned long start = millis();
+    while (millis() - start < ms) {
+        digitalWrite(PIN_BUZZER, HIGH);
+        delayMicroseconds(250);
+        digitalWrite(PIN_BUZZER, LOW);
+        delayMicroseconds(250);
+    }
 }
 
 void beepSuccess() {
@@ -304,60 +358,187 @@ void beepSuccess() {
     beep(150);
 }
 
+unsigned long errorMessageUntil = 0;
+bool isErrorShowing = false;
+
 void blinkError(const char* msg) {
-    for (int i = 0; i < 6; i++) {
-        tft.fillRect(0, 218, 320, 22, C_FOOTER);
-        if (i % 2 == 0) {
-            tft.setFont(NULL);
-            tft.setTextSize(1);
-            tft.setTextColor(C_RED);
-            tft.setCursor(4, 226);
-            tft.print(msg);
-            digitalWrite(PIN_BUZZER, HIGH);
-            delay(200);
-            digitalWrite(PIN_BUZZER, LOW);
-            delay(300);
-        } else {
-            delay(500);
-        }
-    }
-    screenDirty = true;
+    tft.fillRect(0, 218, 320, 22, C_FOOTER);
+    tft.setFont(NULL);
+    tft.setTextSize(1);
+    tft.setTextColor(C_RED);
+    tft.setCursor(4, 226);
+    tft.print(msg);
+    beep(150);
+    isErrorShowing = true;
+    errorMessageUntil = millis() + 2000;
 }
 
 // ══════════════════════════════════════════════════════════════════
 //  CONTROLE DO MOTOR DE PASSO
 // ══════════════════════════════════════════════════════════════════
 
-void enableMotor() {
-    digitalWrite(PIN_ENA, LOW);    // A4988: LOW = ativo
-}
+void enableMotor() { stepper.enableOutputs(); }
 
-void disableMotor() {
-    digitalWrite(PIN_ENA, HIGH);   // A4988: HIGH = livre (sem torque)
-}
+void disableMotor() { stepper.disableOutputs(); }
 
-void moveMotorToAngle(float targetDeg) {
-    float delta = targetDeg - currentMotorAngle;
-    int steps = abs((int)(delta * STEPS_PER_DEG));
+// Motor gira buscando o prumo gravitacional verdadeiro (Nadir absoluto) descendo pelo mesmo caminho para nao tracionar cabos
+void seekNadirBlocking() {
+    enableMotor();
     
-    // DIR: HIGH = sentido horário (aumenta θ, desce), LOW = anti-horário (sobe)
-    digitalWrite(PIN_DIR, delta > 0 ? HIGH : LOW);
+    tft.fillScreen(C_BG);
+    tft.setTextSize(2);
+    tft.setTextColor(C_YELLOW);
+    drawCentered("SEEKING NADIR...", 160, 80);
     
-    for (int i = 0; i < steps; i++) {
-        digitalWrite(PIN_STEP, HIGH);
-        delayMicroseconds(MOTOR_PULSE_US);
-        digitalWrite(PIN_STEP, LOW);
-        delayMicroseconds(MOTOR_PULSE_US);
+    while (true) {
+        sensors_event_t a, g, temp;
+        mpu.getEvent(&a, &g, &temp);
+        
+        // Pega o ângulo RAW original da trigonometria (sem fabs) para ter consciência de se passou do Zero ou não
+        float currentThetaRaw = atan2f(a.acceleration.z, a.acceleration.x) * (180.0f / M_PI);
+        float error = 0.0f - currentThetaRaw;
+        
+        // --- Exibição na Tela em Tempo Real ---
+        static unsigned long lastDraw = 0;
+        if (millis() - lastDraw > 200) {
+            lastDraw = millis();
+            tft.fillRect(60, 120, 200, 40, C_BG);
+            tft.setFont(NULL);
+            tft.setTextSize(3);
+            tft.setTextColor(fabs(error) <= 0.15f ? C_GREEN : C_YELLOW);
+            char angStr[16];
+            // Exibimos em módulo pro usuário enxergar sempre os 0.0 limpos
+            sprintf(angStr, "%.1f deg", fabs(currentThetaRaw));
+            drawCentered(angStr, 160, 140);
+        }
+
+        // --- Homing Mecânico ---
+        if (fabs(error) <= 0.15f) {
+            stepper.setSpeed(0);
+            stepper.runSpeed();
+            delay(150); 
+            mpu.getEvent(&a, &g, &temp);
+            currentThetaRaw = atan2f(a.acceleration.z, a.acceleration.x) * (180.0f / M_PI);
+            if (fabs(0.0f - currentThetaRaw) <= 0.25f) break; // Cravou perfeitamente
+        }
+        
+        float spd;
+        if (fabs(error) > 5.0f) {
+            // No V013: error= +90, a gente mandava -1000 e ele SUUBIA esmagando cabo.
+            // Para DESCER, invertemos: se erro for positivo, spd DEVE SER POSITIVO.
+            spd = (error > 0) ? 1000.0f : -1000.0f;
+        } else {
+            spd = (error > 0) ? 30.0f : -30.0f; // Acoplamento firme. Se passar do 0, o sinal inverte e ele Volta.
+        }
+        
+        stepper.setSpeed(spd);
+        stepper.runSpeed();
+        
+        pollLaser();
+        yield();
     }
     
-    currentMotorAngle = targetDeg;
+    tft.setTextSize(1); // Destrava tamanho de fonte
+    
+    // Sincroniza a posição mecânica física atual a zero passos virtuais
+    stepper.setCurrentPosition(0);
 }
+
+// Motor viaja para o alvo sem trigar o cão de guarda (WDT) do FreeRTOS e sem atolar a porta Serial do Laser
+void moveMotorBlocking(long targetPosition) {
+    stepper.moveTo(targetPosition);
+    while (stepper.distanceToGo() != 0) {
+        stepper.run();
+        pollLaser(); // Drena o buffer da Serial assíncrona p/ n estourar
+        yield();     // Refresca o Watchdog Timer do ESP32 liberando a Thread Idle
+    }
+}
+
+// Motor gira buscando um prumo gravitacional absoluto com malha fechada
+void seekAngleBlocking(float targetAngle) {
+    enableMotor();
+    
+    // Mensagem de Feedback para a UI
+    tft.fillScreen(C_BG);
+    tft.setTextSize(2);
+    tft.setTextColor(C_YELLOW);
+    drawCentered(targetAngle == 0.0f ? "SEEKING NADIR..." : "SEEKING ANGLE...", 160, 120);
+    
+    while (true) {
+        float currentTheta = readIMUAngleDeg();
+        float error = targetAngle - currentTheta;
+        
+        if (fabs(error) <= 0.15f) {
+            stepper.setSpeed(0);
+            stepper.runSpeed();
+            delay(150); // Assenta inércia mecânica
+            currentTheta = readIMUAngleDeg();
+            if (fabs(targetAngle - currentTheta) <= 0.25f) break; // Cravado
+        }
+        
+        float spd;
+        if (fabs(error) > 5.0f) {
+            spd = (error > 0) ? -1000.0f : 1000.0f;
+        } else {
+            spd = (error > 0) ? -50.0f : 50.0f; // Acoplamento firme e seguro
+        }
+        
+        stepper.setSpeed(spd);
+        stepper.runSpeed();
+        
+        pollLaser();
+        yield();
+    }
+    
+    // Assinatura mecânica do Zero: Sincroniza passos virtuais com gravidade!
+    if (targetAngle == 0.0f) {
+        stepper.setCurrentPosition(0);
+    }
+}
+
+
 
 // ══════════════════════════════════════════════════════════════════
 //  SENSOR DE DISTÂNCIA
 // ══════════════════════════════════════════════════════════════════
 
-float readDistanceMM() {
+void pollLaser() {
+#if SIMULACAO_WOKWI
+    static unsigned long lastSim = 0;
+    if (millis() - lastSim > 20) {
+        lastSim = millis();
+        digitalWrite(PIN_TRIG, LOW);
+        delayMicroseconds(2);
+        digitalWrite(PIN_TRIG, HIGH);
+        delayMicroseconds(10);
+        digitalWrite(PIN_TRIG, LOW);
+        long duration = pulseIn(PIN_ECHO, HIGH, 5000); 
+        if (duration > 0) {
+            ultimaDistanciaLaser = ((duration * 0.343f) / 2.0f) / 1000.0f;
+            novaLeituraLaser = true;
+        }
+    }
+#else
+    while (Serial2.available()) {
+        char c = Serial2.read();
+        if (c == '\n' || c == '\r') {
+            if (bufferIndex > 0) {
+                bufferLaser[bufferIndex] = '\0'; // Termina C-String
+                float dist = atof(bufferLaser);
+                if (dist > 0.0f) {
+                    ultimaDistanciaLaser = dist; // Sensor retorna em metros
+                    novaLeituraLaser = true;
+                }
+                bufferIndex = 0; // Reseta buffer
+            }
+        } else if (bufferIndex < 31 && (isDigit(c) || c == '.' || c == '-')) {
+            bufferLaser[bufferIndex++] = c;
+        }
+    }
+#endif
+}
+
+float readDistanceStaticMM() {
 #if SIMULACAO_WOKWI
     digitalWrite(PIN_TRIG, LOW);
     delayMicroseconds(2);
@@ -372,7 +553,6 @@ float readDistanceMM() {
     while (Serial2.available()) Serial2.read();
     
     // Envia comando genérico de leitura única (ASCII)
-    // O comando exato dependerá do datasheet do laser (ex: 'D', 'O', ou frame HEX)
     Serial2.print("D\r\n");
     
     long timeout = millis();
@@ -387,7 +567,7 @@ float readDistanceMM() {
             }
         }
     }
-    
+	
     if (response.length() > 0) {
         float dist_m = response.toFloat(); 
         if (dist_m > 0) return dist_m * 1000.0f; // Retorna em mm
@@ -402,29 +582,33 @@ float readDistanceMM() {
 
 float readIMUAngleDeg() {
 #if SIMULACAO_WOKWI
-    // Na simulação, não podemos "girar o sensor na mão" tão facilmente em tempo de execução.
-    // Assim, se o H já estiver calibrado, calculamos a inclinação (theta) que faria sentido
-    // para a distância hipotética que o usuário ajustou no slider do ultrassônico.
     if (zeroCalibrated && setupH > 0.1f) {
-        float L_m = readDistanceMM() / 1000.0f;
+        float L_m = readDistanceStaticMM() / 1000.0f;
         if (L_m >= setupH) {
-            // Theta é o ângulo em relação à vertical (0° = para baixo)
             return acosf(setupH / L_m) * (180.0f / M_PI);
         }
     }
-    return 0.0f; // 0 graus = Vertical (Nadir)
+    return 0.0f;
 #else
     if (!imuOnline) return 0.0f;
     
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
     
-    // Calcula o ângulo em relação à vertical (Nadir = 0°)
-    // Se ax é a aceleração no eixo do feixe, quando apontado para baixo ax = 1g, az = 0
-    // Logo, o ângulo a partir do nadir é calculado baseando-se no desvio da gravidade.
-    // atan2f(z, x) te dá o ângulo do vetor gravidade em relação ao sensor.
+    // Calcula o ângulo bruto em relação à vertical (Nadir = 0°)
     float angleDeg = atan2f(a.acceleration.z, a.acceleration.x) * (180.0f / M_PI);
-    return fabsf(angleDeg); // O valor exato depende da montagem física do IMU, mas ajustado para que Nadir seja ~0
+    float thetaBruto = fabsf(angleDeg); // Mantém sempre positivo para estabilidade no horizonte
+    
+	// Filtro passa-baixa EMA — retém 60% da memória, absorve 40% da nova leitura
+    static float thetaFiltrado = -1.0f;
+    
+    if (thetaFiltrado < 0.0f) {
+        thetaFiltrado = thetaBruto;
+    } else {
+	   thetaFiltrado = (0.60f * thetaFiltrado) + (0.40f * thetaBruto);
+	 }
+    
+    return thetaFiltrado;
 #endif
 }
 
@@ -432,7 +616,7 @@ float readIMUAngleDeg() {
 //  GRAVAÇÃO NO SD CARD
 // ══════════════════════════════════════════════════════════════════
 
-void openSDFile() {
+bool openSDFile() {
     int ptIndex = currentRadial - 1;
     sprintf(fileName, "/PT%02d.csv", ptIndex);
     dataFile = SD.open(fileName, FILE_WRITE);
@@ -440,10 +624,12 @@ void openSDFile() {
         char ptLabel[48];
         getPointLabel(currentRadial, radialCount, ptLabel);
         dataFile.print("# ");
-        dataFile.println(ptLabel); // Inclui o azimute no cabeçalho (ex: # PONTO 0 (N))
+        dataFile.println(ptLabel);
         dataFile.println("MP,X_m,Theta_deg,L_m,Z_mm");
         dataFile.flush();
+        return true;
     }
+    return false;
 }
 
 void writePointToSD(MeasPoint &pt) {
@@ -454,7 +640,6 @@ void writePointToSD(MeasPoint &pt) {
         dataFile.println(line);
         dataFile.flush();
     }
-    // Eco na Serial para debug
     Serial.printf("MP%d | X=%.3fm | θ=%.2f° | L=%.3fm | Z=%.1fmm\n",
                   pt.mp, pt.x_m, pt.theta_deg, pt.l_m, pt.cota_mm);
 }
@@ -494,7 +679,6 @@ void drawBottomMenu() {
     drawButton(10, 95, 300, 50, C_BTN, C_BORDER,
                "RESOLUTION", RES_LABEL[resLevel]);
                
-    // BACK (50px, ~1/6) na esquerda, START PROJECT (240px, ~5/6) na direita
     drawButton(10, 155, 50, 50, C_RED, C_BORDER,
                "BACK", NULL);
     drawButton(70, 155, 240, 50, C_START, C_BORDER,
@@ -507,15 +691,15 @@ void drawHorizonScreen() {
     tft.fillScreen(C_BG);
     drawHeader();
 
-    tft.setTextColor(C_CYAN);
-    tft.setTextSize(2);
-    tft.setCursor(60, 80);
-    tft.print("HORIZON LEVEL");
-
-    tft.setTextColor(C_WHITE);
     tft.setTextSize(1);
-    tft.setCursor(40, 110);
-    tft.print("Laser is locked at 90 deg.");
+    tft.setFont(&FreeSansBold9pt7b);
+    tft.setTextColor(C_CYAN);
+    drawCentered("HORIZON LEVEL", 160, 50);
+
+    tft.setFont(NULL);
+    tft.setTextSize(1);
+    tft.setTextColor(C_WHITE);
+    drawCentered("Laser is seeking 90.0 deg.", 160, 85);
 
     drawButton(10, 175, 300, 40, C_DIM, C_BORDER, "BACK TO MENU", NULL);
     drawFooter("Motor energized.");
@@ -526,7 +710,7 @@ void drawHorizonScreen() {
 // ══════════════════════════════════════════════════════════════════
 
 void getPointLabel(int radialIndex, int totalRadials, char* buffer) {
-    int pt = radialIndex - 1; // 0-based index
+    int pt = radialIndex - 1;
     if (totalRadials == 8) {
         const char* card[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
         sprintf(buffer, "POINT %d (%s)", pt, card[pt % 8]);
@@ -559,19 +743,17 @@ void drawSetupScreen() {
                    setupCaptureZone.w, setupCaptureZone.h,
                    C_ACCENT, C_BORDER,
                    "CALIBRATE HEIGHT", "Fire laser at nadir");
-    }
+				    }
     // ── ETAPA 2: Capturar Junção (motor livre) ──
     else if (!quinaCaptured) {
         tft.setFont(NULL);
         tft.setTextSize(1);
 
-        // Mostra H calibrado
         tft.setTextColor(C_GREEN);
         char strH[32];
         sprintf(strH, "H = %.3f m (calibrated)", setupH);
         drawCentered(strH, 160, 62);
 
-        // Destaque para Motor Livre
         tft.setTextSize(2);
         tft.setTextColor(C_YELLOW);
         drawCentered("Motor FREE", 160, 80);
@@ -590,13 +772,11 @@ void drawSetupScreen() {
         tft.setFont(NULL);
         tft.setTextSize(1);
 
-        // Mostra H calibrado
         tft.setTextColor(C_GREEN);
         char info1[48];
         sprintf(info1, "H = %.3f m (calibrated)", setupH);
         drawCentered(info1, 160, 60);
 
-        // Mostra dados da junção
         tft.setTextColor(C_CYAN);
         char info2[48], info3[48];
         sprintf(info2, "Rmax = %.2f m   Joint Z = %.0f mm", setupRmax, setupCotaQ);
@@ -607,7 +787,7 @@ void drawSetupScreen() {
         int totalPts = (int)(setupRmax / RES_STEP[resLevel]) + 1;
         char info4[48];
         sprintf(info4, "Expected points: %d (%.0fmm step)", totalPts, RES_STEP[resLevel]*1000);
-        tft.setTextColor(C_DIM);
+		 tft.setTextColor(C_DIM);
         drawCentered(info4, 160, 108);
 
         drawButton(setupCaptureZone.x, setupCaptureZone.y,
@@ -641,7 +821,7 @@ void drawCheckpointScreen() {
         tft.setFont(&FreeSansBold9pt7b);
         tft.setTextColor(C_ACCENT);
         drawCentered(strTitle, 160, 45);
-
+		
         tft.setFont(NULL);
         tft.setTextSize(1);
         tft.setTextColor(C_DIM);
@@ -650,7 +830,6 @@ void drawCheckpointScreen() {
         drawCentered(strInst, 160, 65);
         drawCentered("and tap to capture joint", 160, 77);
 
-        // Resumo da última captura
         if (setupRmax > 0) {
             tft.setTextColor(C_CYAN);
             char strResumo[48];
@@ -679,11 +858,10 @@ void drawCheckpointScreen() {
         
         drawFooter("Rotate equipment to next azimuth.");
     } else {
-        // Todas as Survey Lines concluídas
         tft.setFont(&FreeSansBold9pt7b);
         tft.setTextColor(C_GREEN);
         drawCentered("ACQUISITION COMPLETE", 160, 70);
-
+				
         tft.setFont(NULL);
         tft.setTextSize(1);
         tft.setTextColor(C_DIM);
@@ -705,17 +883,14 @@ void drawCheckpointScreen() {
 // ══════════════════════════════════════════════════════════════════
 
 void updateScanningTelemetry() {
-    // Limpa área de telemetria
     tft.fillRect(10, 65, 300, 110, C_BG);
 
-    // Linha 1: MP e posição
     char tel1[48];
     sprintf(tel1, "MP %d / %d", lastPoint.mp, scanTotalPts);
     tft.setFont(&FreeSansBold9pt7b);
     tft.setTextColor(C_WHITE);
     drawCentered(tel1, 160, 80);
 
-    // Linha 2: X e Cota
     char tel2[48];
     sprintf(tel2, "X=%.2fm   Z=%.0fmm", lastPoint.x_m, lastPoint.cota_mm);
     tft.setFont(NULL);
@@ -724,19 +899,16 @@ void updateScanningTelemetry() {
                      lastPoint.cota_mm < -20 ? C_YELLOW : C_GREEN);
     drawCentered(tel2, 160, 105);
 
-    // Linha 3: θ e L
     char tel3[48];
     sprintf(tel3, "Theta=%.2f   L=%.3fm", lastPoint.theta_deg, lastPoint.l_m);
     tft.setTextColor(C_DIM);
     drawCentered(tel3, 160, 120);
 
-    // Linha 4: Re-disparos
     char tel4[32];
     sprintf(tel4, "Corrections: %d", reshots);
     tft.setTextColor(reshots > 0 ? C_YELLOW : C_DIM);
     drawCentered(tel4, 160, 135);
 
-    // Barra de progresso
     float progress = (scanTotalPts > 0) ?
                      (float)lastPoint.mp / (float)scanTotalPts : 0.0f;
     int barW = (int)(280.0f * progress);
@@ -759,7 +931,6 @@ void drawScanningScreen() {
     updateScanningTelemetry();
 
     if (confirmingStop) {
-        // Desenha popup sobrepondo os controles
         tft.fillRect(0, 100, 320, 120, C_BG);
         tft.drawRect(0, 100, 320, 120, C_RED);
         
@@ -773,7 +944,7 @@ void drawScanningScreen() {
         drawButton(confirmYesZone.x, confirmYesZone.y, confirmYesZone.w, confirmYesZone.h,
                    C_RED, C_WHITE, "YES", "Abort");
                    
-        drawFooter("Motor paused awaiting confirmation.");
+				    drawFooter("Motor paused awaiting confirmation.");
     } else {
         drawButton(scanStopZone.x, scanStopZone.y,
                    scanStopZone.w, scanStopZone.h,
@@ -797,100 +968,26 @@ void startScan() {
 
     enableMotor();
 
-    // O motor já está na posição da quina (setupTheta)
-    // A varredura inicia daqui, decrementando X em direção ao centro
     currentMotorAngle = setupTheta;
 
     openSDFile();
     
-    // Feedback sonoro longo para início
     beep(300);
 }
 
-void executeScanStep() {
-    float step = RES_STEP[resLevel];
-    
-    // Raio-alvo decrementa da borda para o centro
-    float rTarget = setupRmax - (scanIndex * step);
-    
-    if (rTarget < 0.0f) {
-        // Varredura do fundo concluída para esta Survey Line
-        finishSurveyLine();
-        return;
-    }
-    
-    float thetaEst, L, thetaRad, rReal, zReal, cota;
-    bool corrected = false;
-
-    // ── Primeiro disparo ──
-    if (rTarget < 0.001f) {
-        // Ponto central (nadir): apontado para baixo
-        thetaEst = 0.0f;
-    } else {
-        // Angulo a partir da vertical: tan(theta) = R / Z
-        thetaEst = atan2f(rTarget, lastZ) * (180.0f / M_PI);
-    }
-
-    moveMotorToAngle(thetaEst);
-    delay(50);  // Estabilização mecânica
-
-    L = readDistanceMM() / 1000.0f;  // mm → m
-    
-    thetaRad = thetaEst * (M_PI / 180.0f);
-    rReal = L * sinf(thetaRad); // sin para a horizontal
-    zReal = L * cosf(thetaRad); // cos para a vertical
-    cota  = (setupH - zReal) * 1000.0f;  // metros → mm
-
-    // ── Malha fechada: verifica erro radial ──
-    if (rTarget > 0.001f && fabsf(rReal - rTarget) > R_TOLERANCE) {
-        // Recalcula θ com Z real recém-medido
-        lastZ = zReal;
-        thetaEst = atan2f(rTarget, zReal) * (180.0f / M_PI);
-        
-        moveMotorToAngle(thetaEst);
-        delay(50);
-        
-        L = readDistanceMM() / 1000.0f;
-        
-        thetaRad = thetaEst * (M_PI / 180.0f);
-        rReal = L * sinf(thetaRad);
-        zReal = L * cosf(thetaRad);
-        cota  = (setupH - zReal) * 1000.0f;
-
-        reshots++;
-        corrected = true;
-    }
-
-    // ── Grava ponto ──
-    MeasPoint pt;
-    pt.mp        = scanIndex;
-    pt.x_m       = rReal;
-    pt.theta_deg = thetaEst;
-    pt.l_m       = L;
-    pt.cota_mm   = cota;
-
-    writePointToSD(pt);
-    lastPoint = pt;
-
-    // Atualiza Z para próxima iteração
-    lastZ = zReal;
-    scanIndex++;
-}
+void executeScanStep() { /* Destruido */ }
 
 void finishSurveyLine() {
     scanRunning = false;
     closeSDFile();
 
-    // Retorna motor a vertical (0°) e TRAVA para facilitar a proxima leitura
-    moveMotorToAngle(0.0f);
-    // disableMotor(); -> Removido a pedido para manter torque
-
+    moveMotorBlocking(0);
 
     currentRadial++;
     quinaCaptured = false;
     activeScreen = SCR_CHECKPOINT;
     screenDirty = true;
-    
+	
     beepSuccess();
 }
 
@@ -899,16 +996,13 @@ void finishSurveyLine() {
 // ══════════════════════════════════════════════════════════════════
 
 void calibrateZero() {
-    // Motor energizado no nadir (0°) — apontando direto para baixo
     enableMotor();
-    moveMotorToAngle(0.0f);
-    delay(200);  // Estabilização
+    seekNadirBlocking();
 
-    // Múltiplas leituras para média (reduz ruído do sensor)
     float soma = 0.0f;
     int nLeituras = 5;
     for (int i = 0; i < nLeituras; i++) {
-        soma += readDistanceMM();
+        soma += readDistanceStaticMM();
         delay(50);
     }
     float L_mm = soma / nLeituras;
@@ -919,22 +1013,17 @@ void calibrateZero() {
         return;
     }
 
-    // No nadir (θ=0°), L = H diretamente
     setupH      = L_m;
     setupL_zero = L_m;
     zeroCalibrated = true;
 
     Serial.printf("ZERO: H = %.3f m (average of %d readings)\n", setupH, nLeituras);
 
-    // Calcula o ângulo limite correspondente ao alcance máximo do laser no piso (60m)
-    // Se 0° é nadir, a inclinação é theta = acos(H / L_max)
     float thetaLimite = acosf(setupH / 60.0f) * (180.0f / M_PI);
 
-    // Move o laser para apontar para o horizonte do piso (perto dos 89 graus)
-    moveMotorToAngle(thetaLimite);
-    delay(200);
+    long stepsLimite = (long)(thetaLimite * STEPS_PER_DEG);
+    moveMotorBlocking(stepsLimite);
 
-    // Libera motor para o operador fazer o ajuste fino manualmente até a quina
     disableMotor();
     
     beepSuccess();
@@ -947,9 +1036,8 @@ void calibrateZero() {
 // ══════════════════════════════════════════════════════════════════
 
 void captureQuina() {
-    // Lê ângulo do IMU e distância do sensor
     float theta = readIMUAngleDeg();
-    float L_mm  = readDistanceMM();
+    float L_mm  = readDistanceStaticMM();
     float L_m   = L_mm / 1000.0f;
 
     if (L_mm < 10.0f || L_mm > 60000.0f) {
@@ -962,12 +1050,10 @@ void captureQuina() {
     setupTheta = theta;
     setupL     = L_m;
 
-    // Decompõe usando H calibrado no nadir (0°)
-    setupRmax  = L_m * sinf(thetaRad);                // Distância horizontal (sin para 0=nadir)
-    float zQuina = L_m * cosf(thetaRad);               // Profundidade vertical (cos para 0=nadir)
-    setupCotaQ = (setupH - zQuina) * 1000.0f;          // Cota em mm (negativo = recalque)
+    setupRmax  = L_m * sinf(thetaRad);
+    float zQuina = L_m * cosf(thetaRad);
+    setupCotaQ = (setupH - zQuina) * 1000.0f;
 
-    // Validação de sanidade (Raio do tanque max 60m)
     if (setupRmax < 0.5f || setupRmax > 60.0f) {
         blinkError("ERROR: Radius out of bounds (0.5~60m)!");
         return;
@@ -975,9 +1061,6 @@ void captureQuina() {
 
     quinaCaptured = true;
     
-    // CRÍTICO: Como o motor estava livre e o operador moveu com a mão, 
-    // a variável de controle de passos perdeu a referência.
-    // Sincronizamos a posição atual do motor com a realidade lida pelo IMU!
     currentMotorAngle = theta;
 
     Serial.printf("JOINT: θ=%.2f° L=%.3fm Rmax=%.2fm Z=%.0fmm\n",
@@ -993,16 +1076,21 @@ void captureQuina() {
 // ══════════════════════════════════════════════════════════════════
 
 bool getTouch(int16_t &tx, int16_t &ty) {
+    static unsigned long lastTouchTime = 0;
+    if (millis() - lastTouchTime < 250) return false;
 
     if (!ts.touched()) return false;
+    
     TS_Point p = ts.getPoint();
-    tx = p.y;
-    ty = 239 - p.x;
-
+    
+    // Mapeamento deduzido (equivalente ao Modo 6 do teste):
+    // Eixos trocados (p.y controla X, p.x controla Y) com p.x invertido
+    tx = map(p.y, 250, 3800, 0, 320); 
+    ty = map(p.x, 250, 3800, 240, 0);
 
     // Feedback sonoro para o toque
     beep(30);
-    
+    lastTouchTime = millis();
     return true;
 }
 
@@ -1010,9 +1098,19 @@ bool insideZone(int16_t tx, int16_t ty, Zone &z) {
     return (tx >= z.x && tx < z.x + z.w && ty >= z.y && ty < z.y + z.h);
 }
 
+// Função para desenhar um cursor visual onde o toque foi registrado
+void drawTouchCursor(int16_t x, int16_t y) {
+    tft.drawLine(x - 8, y, x + 8, y, C_RED);
+    tft.drawLine(x, y - 8, x, y + 8, C_RED);
+    tft.drawCircle(x, y, 4, C_RED);
+}
+
 void handleTouch() {
     int16_t tx, ty;
     if (!getTouch(tx, ty)) return;
+
+    // Mostra o cursor visual no local do toque
+    // drawTouchCursor(tx, ty); // <-- Desabilitado conforme solicitado
 
     switch (activeScreen) {
 
@@ -1020,22 +1118,19 @@ void handleTouch() {
         if (insideZone(tx, ty, mainMenuZones[0])) {
             activeScreen = SCR_BOTTOM_MENU;
             screenDirty = true;
-        }
+			  }
         else if (insideZone(tx, ty, mainMenuZones[1])) {
             blinkError("Not implemented yet!");
         }
         else if (insideZone(tx, ty, mainMenuZones[2])) {
             activeScreen = SCR_HORIZON;
-            enableMotor();
-            moveMotorToAngle(90.0f); // 90° = Horizontal
+            stepper.enableOutputs();
             screenDirty = true;
         }
         break;
         
     case SCR_HORIZON:
-        // Any click returns to main menu
-        moveMotorToAngle(0.0f); // Volta pro nadir
-        disableMotor();
+        stepper.stop();
         activeScreen = SCR_MAIN_MENU;
         screenDirty = true;
         break;
@@ -1059,8 +1154,7 @@ void handleTouch() {
             zeroCalibrated = false;
             quinaCaptured = false;
             activeScreen = SCR_SETUP;
-            enableMotor();
-            moveMotorToAngle(0.0f);
+            // Motor não é mais zerado aqui de forma invisível. Agora só quando apertar CALIBRATE.
             screenDirty = true;
         }
         break;
@@ -1080,9 +1174,8 @@ void handleTouch() {
             }
         }
         else if (insideZone(tx, ty, setupAbortZone)) {
-            enableMotor();
-            moveMotorToAngle(0.0f); // Volta pro nadir (0)
-            disableMotor();
+            stepper.enableOutputs();
+            stepper.moveTo(0);
             zeroCalibrated = false;
             quinaCaptured = false;
             activeScreen = SCR_BOTTOM_MENU;
@@ -1093,21 +1186,17 @@ void handleTouch() {
     case SCR_CHECKPOINT:
         if (currentRadial <= radialCount) {
             if (insideZone(tx, ty, checkScanZone)) {
-                // Ir para SETUP da próxima Survey Line
-                zeroCalibrated = false; // Exige nova captura de altura (H)
+                zeroCalibrated = false;
                 quinaCaptured = false;
                 
-                // Gira pro nadir para iniciar a calibração
                 enableMotor();
-                moveMotorToAngle(90.0f);
+                moveMotorBlocking((long)(90.0f * STEPS_PER_DEG));
                 
                 activeScreen = SCR_SETUP;
                 screenDirty = true;
             }
             else if (currentRadial > 1 && insideZone(tx, ty, checkUndoZone)) {
-                // Apagar última Survey Line e refazer
                 currentRadial--;
-                // Remove arquivo da Survey Line anterior (que agora virou currentRadial após o decremento)
                 sprintf(fileName, "/PT%02d.csv", currentRadial - 1);
                 SD.remove(fileName);
                 screenDirty = true;
@@ -1117,7 +1206,7 @@ void handleTouch() {
                 activeScreen = SCR_MAIN_MENU;
                 screenDirty = true;
             }
-            else if (currentRadial == 1 && insideZone(tx, ty, checkAbortFullZone)) {
+			 else if (currentRadial == 1 && insideZone(tx, ty, checkAbortFullZone)) {
                 isCalibrated = false;
                 activeScreen = SCR_MAIN_MENU;
                 screenDirty = true;
@@ -1134,22 +1223,19 @@ void handleTouch() {
     case SCR_SCANNING:
         if (!confirmingStop) {
             if (insideZone(tx, ty, scanStopZone)) {
-                // Pausar varredura para confirmação
+                stepper.stop();
                 scanRunning = false;
                 confirmingStop = true;
                 screenDirty = true;
             }
         } else {
             if (insideZone(tx, ty, confirmYesZone)) {
-                // Abortar de fato
                 confirmingStop = false;
                 closeSDFile();
-                // Volta motor para a vertical e trava
-                moveMotorToAngle(0.0f);
+                stepper.moveTo(0);
                 activeScreen = SCR_CHECKPOINT;
                 screenDirty = true;
             } else if (insideZone(tx, ty, confirmNoZone)) {
-                // Retomar varredura
                 confirmingStop = false;
                 scanRunning = true;
                 screenDirty = true;
@@ -1157,8 +1243,6 @@ void handleTouch() {
         }
         break;
     }
-
-    delay(200);  // Debounce tátil
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1176,7 +1260,11 @@ void setup() {
     pinMode(PIN_BUZZER, OUTPUT);
     digitalWrite(PIN_BUZZER, LOW);
     
-    disableMotor();  // Inicia com motor livre
+    stepper.setEnablePin(PIN_ENA);
+    stepper.setPinsInverted(false, false, true); 
+    stepper.setMaxSpeed(2000.0);
+    stepper.setAcceleration(800.0);
+    stepper.disableOutputs(); // Inicia motor livre
 
     // Inicialização do Sensor de Distância
 #if SIMULACAO_WOKWI
@@ -1185,18 +1273,16 @@ void setup() {
 #else
     // UART2 para comunicação com o Laser Industrial
     Serial2.begin(115200, SERIAL_8N1, PIN_LASER_RX, PIN_LASER_TX);
-    // Se o driver RS485 for half-duplex, adicione aqui o pinMode(PIN_DE_RE, OUTPUT);
 #endif
 
     // Barramento I2C
     Wire.begin(21, 22);
 
     // Display TFT e Touch
-
     tft.begin();
     tft.setRotation(1);
-    ts.begin(40); // FT6206
-
+    ts.begin();
+    ts.setRotation(1);
 
     // IMU
     if (mpu.begin()) {
@@ -1218,7 +1304,7 @@ void setup() {
     }
 
     // Verificação do sensor de distância
-    float testDist = readDistanceMM();
+    float testDist = readDistanceStaticMM();
     scanOnline = (testDist > 0);
     Serial.printf("SCAN: %s (%.0fmm)\n", scanOnline ? "Online" : "FAILED", testDist);
 
@@ -1229,8 +1315,15 @@ bool blinkState = false;
 unsigned long lastBlinkMs = 0;
 
 void loop() {
+    // Limpa mensagem de erro após 2 segundos (não-bloqueante)
+    if (isErrorShowing && millis() > errorMessageUntil) {
+        isErrorShowing = false;
+        screenDirty = true;
+    }
+
     // Redesenha tela se necessário
     if (screenDirty) {
+        isErrorShowing = false; // Se a tela for redesenhada por outro motivo, reseta a flag
         switch (activeScreen) {
             case SCR_MAIN_MENU:  drawMainMenu();        break;
             case SCR_BOTTOM_MENU:drawBottomMenu();      break;
@@ -1239,7 +1332,7 @@ void loop() {
             case SCR_CHECKPOINT: drawCheckpointScreen(); break;
             case SCR_SCANNING:   drawScanningScreen();  break;
         }
-        screenDirty = false;
+		        screenDirty = false;
     }
 
     // Animação de piscar para a Etapa 2 do Setup (Motor Livre)
@@ -1249,7 +1342,7 @@ void loop() {
             blinkState = !blinkState;
             tft.setFont(NULL);
             tft.setTextSize(1);
-            tft.fillRect(0, 102, 320, 10, C_BG); // Apaga a área do texto
+            tft.fillRect(0, 102, 320, 10, C_BG);
             tft.setTextColor(blinkState ? C_WHITE : C_BG);
             drawCentered("Point the laser to the FLOOR-WALL JOINT", 160, 102);
         }
@@ -1258,12 +1351,104 @@ void loop() {
     // Processa toque
     handleTouch();
 
+    pollLaser();
+
+    // Controle de Nível Absoluto (Horizonte = 90.0 deg) via Dual-Speed Constante
+    if (activeScreen == SCR_HORIZON) {
+        float currentTheta = readIMUAngleDeg();
+        float error = 90.0f - currentTheta;
+        
+        // Zona morta de 0.15° (filtra o jitter basal do acelerômetro)
+        if (fabs(error) > 0.15f) {
+            float spd;
+            if (fabs(error) > 5.0f) {
+                // Viagem veloz de cruzeiro, taxa fixa (Bang-Bang)
+                spd = (error > 0) ? -1000.0f : 1000.0f;
+            } else {
+                // Acoplamento final, velocidade constante de manobra (Lenta e calculada para evitar overshoot)
+                spd = (error > 0) ? -10.0f : 10.0f;
+            }
+            
+            stepper.setSpeed(spd);
+            stepper.runSpeed();
+        } else {
+            stepper.setSpeed(0);
+            stepper.runSpeed();
+        }
+
+        // Atualização do ângulo em tempo real (centro da tela)
+        static unsigned long lastAngMs = 0;
+        if (millis() - lastAngMs > 200) {
+            lastAngMs = millis();
+            tft.fillRect(60, 110, 200, 40, C_BG); // Apaga o bloco central sem tocar no botão (Y=175)
+            tft.setFont(NULL);
+            tft.setTextSize(3); // Fonte maior e mais chamativa
+            tft.setTextColor(fabs(error) <= 0.15f ? C_GREEN : C_YELLOW);
+            char angStr[16];
+            sprintf(angStr, "%.1f deg", currentTheta);
+            drawCentered(angStr, 160, 130);
+            
+            tft.setTextSize(1); // RESTAURAÇÃO OBRIGATÓRIA DA TIPOGRAFIA BASE
+        }
+    } else {
+        stepper.run();
+    }
+
     // Executa passos de varredura quando ativo
-    if (activeScreen == SCR_SCANNING && scanRunning) {
-        if (millis() - lastScanStepMs > 500) {
-            lastScanStepMs = millis();
-            executeScanStep();
+    if (activeScreen == SCR_SCANNING && scanRunning && !confirmingStop) {
+        if (novaLeituraLaser) {
+            novaLeituraLaser = false;
+            
+            float currentTheta = stepper.currentPosition() / STEPS_PER_DEG;
+            float L_m = ultimaDistanciaLaser;
+            float thetaRad = currentTheta * (M_PI / 180.0f);
+            
+            float rReal = L_m * sinf(thetaRad);
+            float zReal = L_m * cosf(thetaRad);
+            float cota  = (setupH - zReal) * 1000.0f;
+            
+            MeasPoint pt;
+            pt.mp        = scanIndex++;
+            pt.x_m       = rReal;
+            pt.theta_deg = currentTheta;
+            pt.l_m       = L_m;
+            pt.cota_mm   = cota;
+            
+            if (dataFile) {
+                char line[80];
+                sprintf(line, "%d,%.3f,%.4f,%.4f,%.1f", pt.mp, pt.x_m, pt.theta_deg, pt.l_m, pt.cota_mm);
+                dataFile.println(line);
+                
+                if (pt.mp % 50 == 0) {
+                    dataFile.flush();
+                }
+            }
+            lastPoint = pt;
+            
+            if (stepper.distanceToGo() == 0) {
+                finishSurveyLine();
+            }
+        }
+        
+        static unsigned long lastTelMs = 0;
+        if (millis() - lastTelMs > 500) {
+            lastTelMs = millis();
             updateScanningTelemetry();
         }
+    }
+
+    // Telemetria Global do HUD de Ângulo (Canto inferior direito)
+    static unsigned long lastFooterAngMs = 0;
+    if (millis() - lastFooterAngMs > 250) {
+        lastFooterAngMs = millis();
+        float thetaReal = readIMUAngleDeg();
+        // Atualiza apenas a caixa à direita para não flikcar o texto de status
+        tft.fillRect(250, 218, 70, 22, C_FOOTER);
+        tft.setFont(NULL);
+        tft.setTextSize(1);
+        tft.setTextColor(C_WHITE);
+        char globalAngStr[16];
+        sprintf(globalAngStr, "%.1f deg", thetaReal);
+        drawRightAligned(globalAngStr, 316, 226);
     }
 }
