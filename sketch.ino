@@ -57,12 +57,12 @@
 #include <Preferences.h>
 
 Preferences calibPrefs;
-// Referências angulares brutas do MPU6050 calibradas no prumo/nível a laser externo (V046):
+// Referências angulares brutas do MPU6050 calibradas no prumo/nível a laser externo (V058):
 //   - Nadir   (  0,00° real) -> atan2(-Az, Ax) =  +6,96° (H = 784 mm cravado no risco do chão)
-//   - Nível   ( 90,00° real) -> atan2(-Az, Ax) = +88,96° (cravado no nível horizontal)
+//   - Nível   ( 90,00° real) -> atan2(-Az, Ax) = +88,30° (cravado no nível horizontal a L=2150 mm, ajuste -0,65° / -25 mm)
 //   - Zênite  (180,00° real) -> atan2(-Az, Ax) = +176,76° (cravado no prumo do teto)
 float imuRawNadir0Deg    = 6.96f;
-float imuRawHorizon90Deg = 88.96f;
+float imuRawHorizon90Deg = 88.30f;
 float imuRawZenith180Deg = 176.76f;
 float imuPitchOffsetDeg  = 0.00f;  // Trim fino adicional sobre a curva de 3 pontos
 float imuRawUnwrappedDeg = 0.0f;   // Ângulo bruto desdobrado do MPU6050 sem calibração
@@ -150,7 +150,7 @@ unsigned long motorEnergizedSinceMs   = 0;
 #define SCAN_ZONE3_STEP_DEG         2.00f  // Abaixo de 45°: 1 leitura a cada 2,0°
 #define SCAN_PIVOT_OFFSET_MM        55.5f  // V056: Compensacao Cinematica do Pivo Fisico d=55.5mm (Laser na Vertical / Foto 2)
 #define SCAN_KZ_CORRECTION_MM_PER_M 0.00f  // V056: Constante linear radial residual (zerada pois d_pivo absorve 100% da deflexao)
-#define SCAN_VERTEX_GRAZING_H_MM    29.5f  // V058: Offset vertical optico de incidencia rasante na quina parede-piso (55.5 + 29.5 = 85.0 mm)
+#define SCAN_VERTEX_GRAZING_H_MM     9.5f  // V058: Offset fino de spot rasante na quina c/ Horizonte calibrado em 88.30° (55.5 + 9.5 = 65.0 mm)
 
 #define MOTOR_SCAN_SPEED_FAST     40.0f  // Velocidade de transição entre pontos
 #define MOTOR_SCAN_SPEED_NORMAL   36.0f  // Velocidade limpa de avanço entre pontos discretos
@@ -400,9 +400,9 @@ bool insideZone(int16_t tx, int16_t ty, Zone &z);
 
 static inline float computeCalibratedSignedPitchDeg(float rawUnwrappedDeg) {
     float span0to90 = imuRawHorizon90Deg - imuRawNadir0Deg;
-    if (span0to90 < 10.0f) span0to90 = 82.00f;
+    if (span0to90 < 10.0f) span0to90 = 81.34f;
     float span90to180 = imuRawZenith180Deg - imuRawHorizon90Deg;
-    if (span90to180 < 10.0f) span90to180 = 87.80f;
+    if (span90to180 < 10.0f) span90to180 = 88.46f;
 
     float calibratedSigned = 0.0f;
     if (rawUnwrappedDeg <= imuRawHorizon90Deg) {
@@ -414,7 +414,7 @@ static inline float computeCalibratedSignedPitchDeg(float rawUnwrappedDeg) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  MODELO CINEMÁTICO E ÓPTICO V058 (Pivô 55,5 mm + Supressão de Multicaminho Diedro na Quina e Fase Rasante > 58°)
+//  MODELO CINEMÁTICO E ÓPTICO V058 (Pivô 55,5 mm + Horizonte 88,30° + Supressão de Multicaminho Diedro na Quina)
 // ══════════════════════════════════════════════════════════════════
 
 static inline float getActiveSlopeRatio() {
@@ -447,9 +447,6 @@ static inline int32_t computeV058FloorKinematics(float L_m, float thetaDeg, floa
 
     // 3. Compensação de Multicaminho Diedro de Canto (Quina Parede-Piso, θ > 68,5°)
     //    e Deriva de Centro de Fase em Incidência Rasante (58,0° < θ <= 68,5°):
-    //    Acima de 58°, o alongamento elíptico do spot laser no piso (1/cos θ) e, nos últimos ~4°
-    //    antes da quina, a retrorreflexão especular piso->parede adicionam um excesso óptico ΔL > 0
-    //    que rebaixa artificialmente zBaseMM em -20 a -33 mm (faixa MP8..MP43).
     float zCorrMM = zBaseMM;
     if (thetaDeg > 58.0f) {
         float slopeRatio       = getActiveSlopeRatio();
@@ -2512,12 +2509,12 @@ void calibrateZero() {
     // ── PASSO 3: Cálculo Trigonométrico do Vértice Costado-Fundo com Caimento API Standard 650 (V058) ──
     float slopeRatio = getActiveSlopeRatio();
     float dPivM      = SCAN_PIVOT_OFFSET_MM / 1000.0f;
-    float dCornerM   = (SCAN_PIVOT_OFFSET_MM + SCAN_VERTEX_GRAZING_H_MM) / 1000.0f; // 85,0 mm (pivô 55,5 mm + projeção vertical rasante 29,5 mm)
+    float dCornerM   = (SCAN_PIVOT_OFFSET_MM + SCAN_VERTEX_GRAZING_H_MM) / 1000.0f; // 65,0 mm (pivô 55,5 mm + ajuste fino de spot 9,5 mm c/ Horizonte 88,30°)
     float deltaZ_m   = slopeRatio * R_m;
 
-    // V058: Projeção horizontal efetiva R_m e vertical efetiva (H + 85,0 mm - deltaZ) na junção física piso-parede
-    // Elimina o overshoot de +0,86° (+34 mm no costado vertical) que fazia MP0..MP7 iniciarem na parede!
-    float R_axis_m   = R_m;
+    // V058: Projeção horizontal (R_m + d_pivo) e vertical (H + 65,0 mm - deltaZ) na junção física piso-parede
+    // Com o Horizonte calibrado exatamente no nível (88,30° bruto, -25 mm a 2,15 m), mira direto na quina (~73,55°)!
+    float R_axis_m   = R_m + dPivM;
     float H_axis_m   = (setupH + dCornerM) - deltaZ_m;
     if (H_axis_m < 0.05f) H_axis_m = 0.05f;
 
@@ -2525,7 +2522,8 @@ void calibrateZero() {
     float thetaQuinaDeg = thetaQuinaRad * (180.0f / M_PI);
     thetaQuinaDeg = constrain(thetaQuinaDeg, 15.0f, 88.5f);
 
-    float L_quina_m = (R_m / sinf(thetaQuinaRad)) - dPivM; // Distância óptica esperada da lente até a quina física
+    float D_axis_m  = sqrtf((R_axis_m * R_axis_m) + (H_axis_m * H_axis_m));
+    float L_quina_m = D_axis_m - dPivM; // Distância óptica esperada da lente até a quina física
     if (L_quina_m < 0.05f) L_quina_m = 0.05f;
     uint32_t L_quina_mm = (uint32_t)lroundf(L_quina_m * 1000.0f);
 
@@ -2536,7 +2534,7 @@ void calibrateZero() {
     char bufMsg[48];
     sprintf(bufMsg, "Slew Rapido para Vertice (%.2f deg)...", thetaQuinaDeg);
     drawFooter(bufMsg);
-    seekAngleBlocking(thetaQuinaDeg, true); // Slew rápido direto para a quina física (~72,86°)
+    seekAngleBlocking(thetaQuinaDeg, true); // Slew rápido direto para a quina física (~73,55°)
 
     // Amostra o ângulo estático real e a distância laser real na quina logo após cravar o motor
     float settledVertexTheta = readSettledIMUAngleDeg(6, 15);
@@ -3022,9 +3020,13 @@ void setup() {
     ts.begin();
     ts.setRotation(1);
 
-    calibPrefs.begin("geotank", true);
+    calibPrefs.begin("geotank", false);
     imuRawNadir0Deg    = calibPrefs.getFloat("rawNadir0",  6.96f);
-    imuRawHorizon90Deg = calibPrefs.getFloat("rawHoriz90", 88.96f);
+    imuRawHorizon90Deg = calibPrefs.getFloat("rawHoriz90", 88.30f);
+    if (fabsf(imuRawHorizon90Deg - 88.96f) < 0.05f) {
+        imuRawHorizon90Deg = 88.30f;
+        calibPrefs.putFloat("rawHoriz90", 88.30f);
+    }
     imuRawZenith180Deg = calibPrefs.getFloat("rawZen180",  176.76f);
     imuPitchOffsetDeg  = calibPrefs.getFloat("pitchTrim",  0.00f);
     calibPrefs.end();
