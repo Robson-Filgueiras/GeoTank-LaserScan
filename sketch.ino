@@ -150,6 +150,7 @@ unsigned long motorEnergizedSinceMs   = 0;
 #define SCAN_ZONE3_STEP_DEG         2.00f  // Abaixo de 45°: 1 leitura a cada 2,0°
 #define SCAN_PIVOT_OFFSET_MM        55.5f  // V056: Compensacao Cinematica do Pivo Fisico d=55.5mm (Laser na Vertical / Foto 2)
 #define SCAN_KZ_CORRECTION_MM_PER_M 0.00f  // V056: Constante linear radial residual (zerada pois d_pivo absorve 100% da deflexao)
+#define SCAN_VERTEX_GRAZING_H_MM    29.5f  // V058: Offset vertical optico de incidencia rasante na quina parede-piso (55.5 + 29.5 = 85.0 mm)
 
 #define MOTOR_SCAN_SPEED_FAST     40.0f  // Velocidade de transição entre pontos
 #define MOTOR_SCAN_SPEED_NORMAL   36.0f  // Velocidade limpa de avanço entre pontos discretos
@@ -243,10 +244,10 @@ bool  forceImuFilterSync = false;
 #include "priner_logo.h"
 
 /* ================================================================
-   PROJETO:     GeoTank LaserScan v3.0 (Firmware V057 - Correcao Cinematica Radial X e Z + Auto-Busca Rigorosa API 650)
+   PROJETO:     GeoTank LaserScan v3.0 (Firmware V058 - Auto-Busca Exata na Quina + Compensacao Diedro/Rasante Z)
    PLATAFORMA:  ESP32 DevKit C V4
    DESCRIÇÃO:   Perfilometria de fundo de tanque por laser M01-V0.4.
-                - Mantém arquivadas V044 a V056 intactas.
+                - Mantém arquivadas V044 a V057 intactas.
                 - Auto-Busca do Vértice (Quina) Costado-Fundo:
                   1) Busca o Nadir (0,00°) e mede a cota H do instrumento ao piso central por 1,5s com motor travado.
                   2) Slew Rápido para o Horizonte (90,00°) e mede a distância horizontal R ao costado por 1,5s.
@@ -410,6 +411,73 @@ static inline float computeCalibratedSignedPitchDeg(float rawUnwrappedDeg) {
         calibratedSigned = 90.0f + (rawUnwrappedDeg - imuRawHorizon90Deg) * (90.0f / span90to180);
     }
     return calibratedSigned + imuPitchOffsetDeg;
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  MODELO CINEMÁTICO E ÓPTICO V058 (Pivô 55,5 mm + Supressão de Multicaminho Diedro na Quina e Fase Rasante > 58°)
+// ══════════════════════════════════════════════════════════════════
+
+static inline float getActiveSlopeRatio() {
+    if (bottomSlopeType == SLOPE_CONE_DOWN_1_120) return 1.0f / 120.0f;   // +8,33 mm/m
+    if (bottomSlopeType == SLOPE_CONE_UP_1_120)   return -1.0f / 120.0f;  // -8,33 mm/m
+    return 0.0f;                                                          // Plano (0,0 mm/m)
+}
+
+static inline int32_t computeV058FloorKinematics(float L_m, float thetaDeg, float &outR_m) {
+    if (L_m < 0.04f) {
+        outR_m = 0.0f;
+        return 0;
+    }
+    float thetaRad = thetaDeg * (M_PI / 180.0f);
+    float cosT     = cosf(thetaRad);
+    float sinT     = sinf(thetaRad);
+    float dPivM    = SCAN_PIVOT_OFFSET_MM / 1000.0f;
+
+    // 1. Raio horizontal cinemático com braço de alavanca do pivô (55,5 mm)
+    float rReal = (L_m + dPivM) * sinT;
+    if (setupRmax > 0.10f && rReal > setupRmax) {
+        rReal = setupRmax;
+    }
+    outR_m = rReal;
+
+    // 2. Cota Z cinemática base (exata de 0° a 58° e em retornos difusos diretos do piso)
+    float zBaseMM = ((setupH - (L_m * cosT)) * 1000.0f)
+                  + (SCAN_PIVOT_OFFSET_MM * (1.0f - cosT))
+                  + (SCAN_KZ_CORRECTION_MM_PER_M * rReal);
+
+    // 3. Compensação de Multicaminho Diedro de Canto (Quina Parede-Piso, θ > 68,5°)
+    //    e Deriva de Centro de Fase em Incidência Rasante (58,0° < θ <= 68,5°):
+    //    Acima de 58°, o alongamento elíptico do spot laser no piso (1/cos θ) e, nos últimos ~4°
+    //    antes da quina, a retrorreflexão especular piso->parede adicionam um excesso óptico ΔL > 0
+    //    que rebaixa artificialmente zBaseMM em -20 a -33 mm (faixa MP8..MP43).
+    float zCorrMM = zBaseMM;
+    if (thetaDeg > 58.0f) {
+        float slopeRatio       = getActiveSlopeRatio();
+        float zNominalFloorMM  = (slopeRatio * rReal) * 1000.0f;
+        float opticalDeficitMM = zNominalFloorMM - zBaseMM;
+
+        float maxOpticalEnvelopeMM = 0.0f;
+        float gain = 0.0f;
+        if (thetaDeg <= 68.5f) {
+            float u = (thetaDeg - 58.0f) / 10.5f;
+            maxOpticalEnvelopeMM = 8.0f + (16.0f * u);
+            gain = 0.88f;
+        } else {
+            float uCorner = (thetaDeg - 68.5f) / 4.5f;
+            if (uCorner > 1.0f) uCorner = 1.0f;
+            maxOpticalEnvelopeMM = 24.0f + (18.0f * uCorner);
+            gain = 0.92f;
+        }
+
+        if (opticalDeficitMM > 0.0f && opticalDeficitMM <= (maxOpticalEnvelopeMM + 6.0f)) {
+            zCorrMM = zBaseMM + (gain * opticalDeficitMM);
+        } else if (opticalDeficitMM > (maxOpticalEnvelopeMM + 6.0f) && thetaDeg >= 68.5f && opticalDeficitMM < 46.0f) {
+            // Na zona de diedro da quina (> 68,5°), limita picos intensos de reflexão mantendo detecção de degraus > 46 mm
+            zCorrMM = zBaseMM + (gain * maxOpticalEnvelopeMM);
+        }
+    }
+
+    return (int32_t)lroundf(zCorrMM);
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1667,7 +1735,7 @@ bool openSDFile() {
         getPointLabel(currentRadial, radialCount, ptLabel);
         getCurrentDateTimeStr(dateStr, sizeof(dateStr), timeStr, sizeof(timeStr));
 
-        dataFile.printf("# %s - Inicio: %s %s - H=%u mm - d_pivo=%.1f mm - API 650: %s (V057)\n",
+        dataFile.printf("# %s - Inicio: %s %s - H=%u mm - d_pivo=%.1f mm - API 650: %s (V058)\n",
                         ptLabel, dateStr, timeStr, (unsigned int)setupH_mm, SCAN_PIVOT_OFFSET_MM, SLOPE_SHORT[bottomSlopeType]);
         dataFile.println("MP;Data;Hora;X_m;Theta_deg;L_m;Z_mm;Fallback");
         dataFile.flush();
@@ -1842,12 +1910,8 @@ void drawJointStepButton() {
 void updateJointTelemetry() {
     float curTheta = readIMUAngleDeg();
     float distL    = ultimaDistanciaLaser;
-    float thetaRad = curTheta * (M_PI / 180.0f);
-    float dPivM    = SCAN_PIVOT_OFFSET_MM / 1000.0f;
-    float radiusR  = (distL >= 0.04f) ? ((distL + dPivM) * sinf(thetaRad)) : 0.0f;
-    float zPivComp = (distL >= 0.04f) ? (SCAN_PIVOT_OFFSET_MM * (1.0f - cosf(thetaRad))) : 0.0f;
-    int32_t cotaZ  = (distL >= 0.04f) ? 
-        (int32_t)lroundf(((setupH - (distL * cosf(thetaRad))) * 1000.0f) + zPivComp + (SCAN_KZ_CORRECTION_MM_PER_M * radiusR)) : 0;
+    float radiusR  = 0.0f;
+    int32_t cotaZ  = (distL >= 0.04f) ? computeV058FloorKinematics(distL, curTheta, radiusR) : 0;
 
     tft.setFont(&FreeSansBold9pt7b);
 
@@ -2275,12 +2339,9 @@ void startScan() {
         setupTheta     = liveImuTheta;
         setupL_mm      = (uint32_t)resyncL_mm;
         setupL         = (float)setupL_mm / 1000.0f;
-        float thetaRad = setupTheta * (M_PI / 180.0f);
-        float dPivM    = SCAN_PIVOT_OFFSET_MM / 1000.0f;
-        setupRmax      = (setupL + dPivM) * sinf(thetaRad);
-        float zPivComp = SCAN_PIVOT_OFFSET_MM * (1.0f - cosf(thetaRad));
-        setupCotaQ     = (int32_t)lroundf(((setupH - (setupL * cosf(thetaRad))) * 1000.0f) + zPivComp + (SCAN_KZ_CORRECTION_MM_PER_M * setupRmax));
-        Serial.printf("[SCAN V057] Quina ressincronizada c/ d=%.1fmm: θ=%.2f° | L=%u mm | Rmax=%.3fm | Z=%d mm\n",
+        setupRmax      = 0.0f;
+        setupCotaQ     = computeV058FloorKinematics(setupL, setupTheta, setupRmax);
+        Serial.printf("[SCAN V058] Quina ressincronizada c/ d=%.1fmm: θ=%.2f° | L=%u mm | Rmax=%.3fm | Z=%d mm\n",
                       SCAN_PIVOT_OFFSET_MM, setupTheta, (unsigned int)setupL_mm, setupRmax, (int)setupCotaQ);
     }
 
@@ -2325,7 +2386,7 @@ void startScan() {
     printSerialRemoteStatus();
 
     long totalSteps = (long)lroundf(setupTheta * STEPS_PER_DEG);
-    Serial.printf("[SCAN V057] Ponto-a-Ponto + Compensacao Cinematica d_pivo=%.1f mm (TFT e CSV) iniciado: θ_ini=%.2f° (%ld passos, %d pontos previstos)\n",
+    Serial.printf("[SCAN V058] Ponto-a-Ponto + Compensacao Cinematica d_pivo=%.1f mm (TFT e CSV) iniciado: θ_ini=%.2f° (%ld passos, %d pontos previstos)\n",
                   SCAN_PIVOT_OFFSET_MM, setupTheta, totalSteps, scanTotalPts);
     Serial.println("  -> Zona 1 (> 63°): menor passo (0,1125°) + parada >= 0,5s c/ Kz aplicado");
     Serial.println("  -> Zona 2 (63° a 45°): 50 pontos exatos (0,36°/pt) + parada >= 0,5s c/ Kz aplicado");
@@ -2448,49 +2509,50 @@ void calibrateZero() {
     Serial.printf("[COSTADO REAL] R medido = %d mm (%.3f m).\n", (int)R_mm, R_m);
     beepSuccess();
 
-    // ── PASSO 3: Cálculo Trigonométrico do Vértice Costado-Fundo com Caimento API Standard 650 ──
-    float slopeRatio = 0.0f;
-    if (bottomSlopeType == SLOPE_CONE_DOWN_1_120) {
-        slopeRatio = 1.0f / 120.0f;  // +8.33 mm/m: fundo sobe em direcao a quina
-    } else if (bottomSlopeType == SLOPE_CONE_UP_1_120) {
-        slopeRatio = -1.0f / 120.0f; // -8.33 mm/m: fundo desce em direcao a quina
-    } else {
-        slopeRatio = 0.0f;           // Plano nominal
-    }
+    // ── PASSO 3: Cálculo Trigonométrico do Vértice Costado-Fundo com Caimento API Standard 650 (V058) ──
+    float slopeRatio = getActiveSlopeRatio();
+    float dPivM      = SCAN_PIVOT_OFFSET_MM / 1000.0f;
+    float dCornerM   = (SCAN_PIVOT_OFFSET_MM + SCAN_VERTEX_GRAZING_H_MM) / 1000.0f; // 85,0 mm (pivô 55,5 mm + projeção vertical rasante 29,5 mm)
+    float deltaZ_m   = slopeRatio * R_m;
 
-    float dPivM     = SCAN_PIVOT_OFFSET_MM / 1000.0f;
-    float deltaZ_m  = slopeRatio * R_m;
-    // V057: Compensacao cinemática rigorosa do centro de rotação nos eixos X e Z para auto-busca exata da quina
-    float R_axis_m  = R_m + dPivM;
-    float H_axis_m  = (setupH + dPivM) - deltaZ_m;
-    if (H_axis_m < 0.05f) H_axis_m = 0.05f; // Protecao de segurança contra divisão
+    // V058: Projeção horizontal efetiva R_m e vertical efetiva (H + 85,0 mm - deltaZ) na junção física piso-parede
+    // Elimina o overshoot de +0,86° (+34 mm no costado vertical) que fazia MP0..MP7 iniciarem na parede!
+    float R_axis_m   = R_m;
+    float H_axis_m   = (setupH + dCornerM) - deltaZ_m;
+    if (H_axis_m < 0.05f) H_axis_m = 0.05f;
 
     float thetaQuinaRad = atan2f(R_axis_m, H_axis_m);
     float thetaQuinaDeg = thetaQuinaRad * (180.0f / M_PI);
     thetaQuinaDeg = constrain(thetaQuinaDeg, 15.0f, 88.5f);
 
-    float D_axis_m  = sqrtf((R_axis_m * R_axis_m) + (H_axis_m * H_axis_m));
-    float L_quina_m = D_axis_m - dPivM; // Distância óptica real da lente até o vértice
+    float L_quina_m = (R_m / sinf(thetaQuinaRad)) - dPivM; // Distância óptica esperada da lente até a quina física
     if (L_quina_m < 0.05f) L_quina_m = 0.05f;
     uint32_t L_quina_mm = (uint32_t)lroundf(L_quina_m * 1000.0f);
 
-    Serial.printf("[API 650 VERTICE] Perfil: %s | H=%.3fm | R=%.3fm | DeltaZ=%+dmm | ThetaQuina=%.2f deg | L_hipotenusa=%.3fm\n",
+    Serial.printf("[API 650 VERTICE V058] Perfil: %s | H=%.3fm | R=%.3fm | DeltaZ=%+dmm | ThetaQuina=%.2f deg | L_hipotenusa=%.3fm\n",
                   SLOPE_LABEL[bottomSlopeType], setupH, R_m, (int)lroundf(deltaZ_m * 1000.0f), thetaQuinaDeg, L_quina_m);
 
-    // ── PASSO 4: Slew Rápido direto para o Vértice Calculado ──
+    // ── PASSO 4: Slew Rápido direto para o Vértice Físico + Amostragem Real na Quina ──
     char bufMsg[48];
-    sprintf(bufMsg, "Slew Rapido para Vertice (%.1f deg)...", thetaQuinaDeg);
+    sprintf(bufMsg, "Slew Rapido para Vertice (%.2f deg)...", thetaQuinaDeg);
     drawFooter(bufMsg);
-    seekAngleBlocking(thetaQuinaDeg, true); // Slew rápido direto para a quina
+    seekAngleBlocking(thetaQuinaDeg, true); // Slew rápido direto para a quina física (~72,86°)
 
-    // Salva os parâmetros geométricos da quina
+    // Amostra o ângulo estático real e a distância laser real na quina logo após cravar o motor
+    float settledVertexTheta = readSettledIMUAngleDeg(6, 15);
+    int32_t measuredVertexL  = readDistanceTimedAverageMM(900, 2, true);
+    if (measuredVertexL >= 100 && measuredVertexL <= 65000) {
+        L_quina_mm = (uint32_t)measuredVertexL;
+        L_quina_m  = (float)L_quina_mm / 1000.0f;
+    }
+
     setupL_mm     = L_quina_mm;
     setupL        = L_quina_m;
-    setupTheta    = thetaQuinaDeg;
+    setupTheta    = (imuOnline && settledVertexTheta > 5.0f) ? settledVertexTheta : thetaQuinaDeg;
     setupRmax     = R_m;
-    float zQuina  = L_quina_m * cosf(thetaQuinaRad);
-    float zPivComp = SCAN_PIVOT_OFFSET_MM * (1.0f - cosf(thetaQuinaRad));
-    setupCotaQ    = (int32_t)lroundf(((setupH - zQuina) * 1000.0f) + zPivComp + (SCAN_KZ_CORRECTION_MM_PER_M * setupRmax));
+    float rCalcQ  = R_m;
+    setupCotaQ    = computeV058FloorKinematics(setupL, setupTheta, rCalcQ);
+    setupRmax     = rCalcQ;
     quinaCaptured = true;
 
     beepSuccess();
@@ -2534,11 +2596,8 @@ void captureQuina() {
     setupTheta = theta;
     setupL     = L_m;
 
-    float dPivM   = SCAN_PIVOT_OFFSET_MM / 1000.0f;
-    setupRmax    = (L_m + dPivM) * sinf(thetaRad);
-    float zQuina = L_m * cosf(thetaRad);
-    float zPivComp = SCAN_PIVOT_OFFSET_MM * (1.0f - cosf(thetaRad));
-    setupCotaQ   = (int32_t)lroundf(((setupH - zQuina) * 1000.0f) + zPivComp + (SCAN_KZ_CORRECTION_MM_PER_M * setupRmax));
+    setupRmax    = 0.0f;
+    setupCotaQ   = computeV058FloorKinematics(L_m, theta, setupRmax);
 
     if (setupRmax < 0.02f || setupRmax > 60.0f) {
         blinkError("ERROR: Radius out of bounds (0.02~60m)!");
@@ -2579,13 +2638,14 @@ void printSerialRemoteStatus() {
                           imuPitchDeg, SLOPE_SHORT[bottomSlopeType], motorCurrentlyEnergized ? "ENERGIZADO" : "FRIO/OFF");
             Serial.println("  Atalhos COM5 -> [1] ou [N]: Auto-Busca Nadir + Horizonte + Vertice | [B]: Perfil | [0]: Voltar");
             break;
-        case SCR_JOINT:
+        case SCR_JOINT: {
+            float rJoint = 0.0f;
+            int32_t zJoint = computeV058FloorKinematics(ultimaDistanciaLaser, imuPitchDeg, rJoint);
             Serial.printf("[TELA: AJUSTE DO JOINT] Pitch=%.2f° | Passo=%.1f° | Dist=%.3fm | Raio=%.3fm | Cota=%dmm\n",
-                          imuPitchDeg, JOINT_STEPS[jointStepIdx], ultimaDistanciaLaser,
-                          (ultimaDistanciaLaser + (SCAN_PIVOT_OFFSET_MM / 1000.0f)) * sinf(imuPitchDeg * M_PI / 180.0f),
-                          (int)lroundf(((setupH - (ultimaDistanciaLaser * cosf(imuPitchDeg * M_PI / 180.0f))) * 1000.0f) + (SCAN_PIVOT_OFFSET_MM * (1.0f - cosf(imuPitchDeg * M_PI / 180.0f))) + (SCAN_KZ_CORRECTION_MM_PER_M * (ultimaDistanciaLaser * sinf(imuPitchDeg * M_PI / 180.0f)))));
+                          imuPitchDeg, JOINT_STEPS[jointStepIdx], ultimaDistanciaLaser, rJoint, (int)zJoint);
             Serial.println("  Atalhos COM5 -> [+] Subir | [-] Descer | [P] Passo | [4/N] Iniciar Varredura | [0] Voltar Nadir");
             break;
+        }
         case SCR_SCANNING:
             Serial.printf("[VARREDURA EM CURSO] Radial %d/%d | Vel=%.1f passos/s | Envie [0] ou [X] p/ Parar\n",
                           currentRadial, radialCount, activeSweepSpeedSteps);
@@ -2918,7 +2978,7 @@ void handleTouch() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("GeoTank LaserScan v3.0 (Firmware V057 - Correcao Cinematica Radial X e Z + Auto-Busca Rigorosa API 650) - Inicializando...");
+    Serial.println("GeoTank LaserScan v3.0 (Firmware V058 - Auto-Busca Exata na Quina + Compensacao Diedro/Rasante Z) - Inicializando...");
 
     initInternalRTCFromCompileTime();
     char dStr[16], tStr[16];
@@ -3464,14 +3524,9 @@ void loop() {
 
                 if (avgMM > 0) {
                     float L_m      = (float)avgMM / 1000.0f;
-                    float thetaRad = thetaDeg * (M_PI / 180.0f);
-
-                    float dPivM = SCAN_PIVOT_OFFSET_MM / 1000.0f;
-                    float rReal = (L_m + dPivM) * sinf(thetaRad);
-                    float zReal = L_m * cosf(thetaRad);
-                    // V056: Compensacao cinematica do pivo fisico d=55.5mm (Laser na Vertical) + filtro mediana tripla
-                    float zPivComp_mm  = SCAN_PIVOT_OFFSET_MM * (1.0f - cosf(thetaRad));
-                    int32_t rawCotaMM  = (int32_t)lroundf(((setupH - zReal) * 1000.0f) + zPivComp_mm + (SCAN_KZ_CORRECTION_MM_PER_M * rReal));
+                    float rReal    = 0.0f;
+                    // V058: Modelo cinemático d_pivo=55.5mm + supressão de multicaminho diedro na quina e deriva rasante (> 58°)
+                    int32_t rawCotaMM  = computeV058FloorKinematics(L_m, thetaDeg, rReal);
                     int32_t filtCotaMM = filterDynamicCotaMM(rawCotaMM);
 
                     // V054 (API 653): Detecção em tempo real de Obstruções Físicas (Tubulações, Serpentinas, Colunas)
