@@ -150,7 +150,7 @@ unsigned long motorEnergizedSinceMs   = 0;
 #define SCAN_ZONE3_STEP_DEG         2.00f  // Abaixo de 45°: 1 leitura a cada 2,0°
 #define SCAN_PIVOT_OFFSET_MM        55.5f  // V056: Compensacao Cinematica do Pivo Fisico d=55.5mm (Laser na Vertical / Foto 2)
 #define SCAN_KZ_CORRECTION_MM_PER_M 0.00f  // V056: Constante linear radial residual (zerada pois d_pivo absorve 100% da deflexao)
-#define SCAN_VERTEX_GRAZING_H_MM     9.5f  // V058: Offset fino de spot rasante na quina c/ Horizonte calibrado em 88.30° (55.5 + 9.5 = 65.0 mm)
+#define SCAN_VERTEX_GRAZING_H_MM    -4.5f  // V058: Trim vertical da quina validado em bancada a 3mm da parede no piso (55.5 - 4.5 = 51.0 mm -> 73.46°)
 
 #define MOTOR_SCAN_SPEED_FAST     40.0f  // Velocidade de transição entre pontos
 #define MOTOR_SCAN_SPEED_NORMAL   36.0f  // Velocidade limpa de avanço entre pontos discretos
@@ -2524,11 +2524,14 @@ void calibrateZero() {
     Serial.printf("[API 650 VERTICE V058] Perfil: %s | H=%.3fm | R=%.3fm | DeltaZ=%+dmm | ThetaQuina=%.2f deg | L_hipotenusa=%.3fm\n",
                   SLOPE_LABEL[bottomSlopeType], setupH, R_m, (int)lroundf(deltaZ_m * 1000.0f), thetaQuinaDeg, L_quina_m);
 
-    // ── PASSO 4: Slew Rápido direto para o Vértice Físico + Amostragem Real na Quina ──
+    // ── PASSO 4: Slew Rápido com Aproximação Anti-Backlash de Baixo para Cima + Amostragem Real na Quina ──
     char bufMsg[48];
     sprintf(bufMsg, "Slew Rapido para Vertice (%.2f deg)...", thetaQuinaDeg);
     drawFooter(bufMsg);
-    seekAngleBlocking(thetaQuinaDeg, true); // Slew rápido direto para a quina física (~73,55°)
+    if (thetaQuinaDeg > 18.0f) {
+        seekAngleBlocking(thetaQuinaDeg - 1.5f, true); // Desce de 90° até 1,5° abaixo da quina em Slew Rápido
+    }
+    seekAngleBlocking(thetaQuinaDeg, false); // Aproxima suavemente subindo até cravar na quina (~73,44° a 3mm no piso)
 
     // Amostra o ângulo estático real e a distância laser real na quina logo após cravar o motor
     float settledVertexTheta = readSettledIMUAngleDeg(6, 15);
