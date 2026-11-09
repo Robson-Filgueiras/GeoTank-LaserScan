@@ -113,7 +113,7 @@ unsigned long lastAnyByteLaserMs = 0;
 unsigned long lastContCmdMs = 0;
 bool laserContActive   = false;
 bool keepLaserAlive    = false;
-bool useQuickLaserMode = true;  // V046: Modo Rápido 0x22 (~3.2 Hz) ativo por padrão para garantir leituras na janela de 0,5s!
+bool useQuickLaserMode = false; // V058: Modo Contínuo Padrão 0x21 (3.2 Hz contínuos reais) ativo por padrão; 0x22 interrompe após 1 amostra
 
 // ── Gerador de Pulsos por Acumulador Inteiro de 64 bits com Spinlock Multi-Core ──
 // motorBgMode:
@@ -1014,19 +1014,12 @@ bool decodeM01Frame(const uint8_t* f, int len, float &dist_m, uint32_t &dist_mm)
         raw_bcd = raw_bcd * 100 + (hi * 10 + lo);
     }
 
-    uint32_t raw_bin = ((uint32_t)f[6] << 24) |
-                       ((uint32_t)f[7] << 16) |
-                       ((uint32_t)f[8] << 8)  |
-                       ((uint32_t)f[9]);
-
-    dist_mm = is_bcd ? raw_bcd : raw_bin;
-    if (dist_mm == 0 || dist_mm > 60000) {
-        if (is_bcd && raw_bin > 0 && raw_bin <= 60000) {
-            dist_mm = raw_bin;
-        } else {
-            return false;
-        }
+    // V058: Protocolo M01-V0.4 é estritamente BCD nos bytes 6..9.
+    // Rejeita pacotes de status/erro óptico com nibbles hexadecimais A..F (evita falsos 11,9m / 21,3m / 44,6m na quina)
+    if (!is_bcd || raw_bcd < 40 || raw_bcd > 50000) {
+        return false;
     }
+    dist_mm = raw_bcd;
 
     dist_m = (float)dist_mm / 1000.0f;
     return true;
@@ -1223,7 +1216,8 @@ int32_t readDistanceTimedAverageMM(unsigned long durationMs = 1500, int minSampl
     resetTimeWindow();
     keepLaserAlive = true;
 
-    if (!laserContActive || (millis() - lastAnyByteLaserMs > 3800UL)) {
+    // V058: Rearma imediatamente o trem contínuo ao iniciar medição estática após Slew Rápido (0° -> 90° -> Quina)
+    if (!laserContActive || (millis() - lastValidLaserMs > 350UL)) {
         while (Serial2.available()) Serial2.read();
         sendActiveContinuousCmd();
         laserContActive = true;
